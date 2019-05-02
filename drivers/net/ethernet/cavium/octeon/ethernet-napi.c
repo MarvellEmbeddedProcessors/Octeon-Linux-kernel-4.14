@@ -147,7 +147,9 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
 			    cores_in_use < core_state.baseline_cores)
 				cvm_oct_enable_one_cpu();
 		}
-		rx_count++;
+#ifndef CAVIUM_NET_PACKET_FWD_OFFLOAD
+					rx_count++;
+#endif
 
 		/* If WORD2[SOFTWARE] then this WQE is a complete for
 		 * a TX packet.
@@ -410,9 +412,15 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
 						/* Interceptor took our packet */
 						break;
 					}
+#ifdef CAVIUM_NET_PACKET_FWD_OFFLOAD
+					rx_count++;
+#endif
 				} else {
 					netif_receive_skb(skb);
 					callback_result = CVM_OCT_PASS;
+#ifdef CAVIUM_NET_PACKET_FWD_OFFLOAD
+					rx_count++;
+#endif
 				}
 			} else {
 				/* Drop any packet received for a device that isn't up */

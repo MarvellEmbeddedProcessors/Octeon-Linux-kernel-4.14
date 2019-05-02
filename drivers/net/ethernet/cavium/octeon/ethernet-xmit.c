@@ -155,7 +155,11 @@ CVM_OCT_XMIT
 	pko_command.s.le = 1;
 #endif
 	/* Don't pollute L2 with the outgoing packet */
+#ifdef CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD
+	pko_command.s.n2 = 0;
+#else
 	pko_command.s.n2 = 1;
+#endif
 	pko_command.s.segs = 1;
 	pko_command.s.total_bytes = skb->len;
 	/* Use fau0 to decrement the number of packets queued */

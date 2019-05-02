@@ -191,6 +191,15 @@ struct octeon3_rx {
 	cpumask_t rx_affinity_hint;
 };
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+struct octeon3_tx_cpustats {
+	long tx_packets;
+	long tx_octets;
+	long tx_dropped;
+	long tx_backlog_cache;
+};
+#endif
+
 struct octeon3_ethernet {
 	struct bgx_port_netdev_priv bgx_priv; /* Must be first element. */
 	struct list_head list;
@@ -219,9 +228,13 @@ struct octeon3_ethernet {
 	atomic64_t rx_errors;
 	atomic64_t rx_length_errors;
 	atomic64_t rx_crc_errors;
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	struct octeon3_tx_cpustats __percpu *tx_stats;
+#else
 	atomic64_t tx_packets;
 	atomic64_t tx_octets;
 	atomic64_t tx_dropped;
+#endif
 	/*
 	 * The following two fields need to be on a different cache line as
 	 * they are updated by pko which invalidates the cache every time it
@@ -327,6 +340,12 @@ struct net_device *octeon3_register_callback(const char		*device_name,
 
 	rcu_read_lock();
 	for (node = 0; node < MAX_NODES; node++) {
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+		if (!octeon3_eth_node[node].init_done) {
+			/* Node not inited */
+			continue;
+		}
+#endif
 		list_for_each_entry_rcu(priv,
 					&octeon3_eth_node[node].device_list,
 					list) {
@@ -342,6 +361,35 @@ struct net_device *octeon3_register_callback(const char		*device_name,
 	return NULL;
 }
 EXPORT_SYMBOL(octeon3_register_callback);
+
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+/* Comment: Register a intercept callback
+ * for the named device.
+ * It returns the net_device structure
+ * for the ethernet port.
+ */
+struct net_device *octeon3_is_oct_dev(const char *device_name)
+{
+	struct octeon3_ethernet	*priv;
+	int			node;
+
+	for (node = 0; node < MAX_NODES; node++) {
+		if (!octeon3_eth_node[node].init_done) {
+			/* Node not inited */
+			continue;
+		}
+		list_for_each_entry_rcu(priv,
+					&octeon3_eth_node[node].device_list,
+					list) {
+			if (strcmp(device_name, priv->netdev->name) == 0)
+				return priv->netdev;
+		}
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL(octeon3_is_oct_dev);
+#endif
 
 /* octeon3_eth_sso_pass1_limit:	Near full TAQ can cause hang. When the TAQ
  *				(Transitory Admission Queue) is near-full, it is
@@ -809,8 +857,29 @@ static int octeon3_eth_global_init(unsigned int node)
 	if (rv)
 		goto done;
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	/* Comment: Since each linux interface
+	 * is equivalent to a logical mac, and
+	 * MAX_TX_QUEUE_DEPTH is a per linux
+	 * interface limit, we need to fill pko_aura
+	 * with buffers sufficient for all
+	 * logical mac's i.e say
+	 * cvmx_helper_get_number_of_interfaces() *
+	 * 4 * MAX_TX_QUEUE_DEPTH. Since pko might
+	 * not need one pko_aura buffer per packet
+	 * enqueued, we are filling it a bit less.
+	 * Also in octeon3_transmit_qos() worst
+	 * case scenario, it would have already
+	 * enqueued MAX_TX_QUEUE_DEPTH * 2 packets.
+	 */
+	rv = octeon_mem_fill_fpa3(node, octeon3_eth_sso_pko_cache,
+				   oen->pko_aura,
+				   cvmx_helper_get_number_of_interfaces() *
+				   MAX_TX_QUEUE_DEPTH);
+#else
 	rv = octeon_mem_fill_fpa3(node, octeon3_eth_sso_pko_cache,
 				   oen->pko_aura, 1024);
+#endif
 	if (rv)
 		goto done;
 
@@ -885,7 +954,11 @@ done:
 	return rv;
 }
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+static inline struct sk_buff *octeon3_eth_work_to_skb(void *w)
+#else
 static struct sk_buff *octeon3_eth_work_to_skb(void *w)
+#endif
 {
 	struct sk_buff *skb;
 	void **f = w;
@@ -1179,6 +1252,13 @@ static int octeon3_eth_rx_one(struct octeon3_rx *rx, bool is_async,
 			if (OCTEON_IS_MODEL(OCTEON_CN78XX_PASS1_X)) {
 				/* PKI_BUFLINK_S's are endian-swapped */
 				packet_ptr.u64 = swab64(packet_ptr.u64);
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+				/* Comment: Store that swapped
+				 * packet pointer back
+				 * Just in case anyone want to use it later
+				 */
+				*(u64 *)(data - 8) = packet_ptr.u64;
+#endif
 			}
 #endif
 			data = phys_to_virt(packet_ptr.addr);
@@ -1239,10 +1319,23 @@ static int octeon3_eth_rx_one(struct octeon3_rx *rx, bool is_async,
 				 * as it's impossible to free the skb without
 				 * freeing the work.
 				 */
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+				/* Comment: But since this was the result
+				 * to be supported
+				 * when dis_wq_dat is not clear
+				 * i.e when first data
+				 * is not present in the left over
+				 * space of work.
+				 * For now since dis_wq_dat is clear,
+				 * freeing skb == freeing work. Hence falling
+				 * through without complaining.
+				 */
+#else
 				WARN_ONCE(true,
 					  "unsupported intercept result %d",
 					  cb_result);
 				break;
+#endif
 			case CVM_OCT_TAKE_OWNERSHIP_SKB:
 				/* Interceptor took our packet */
 				break;
@@ -1567,7 +1660,15 @@ static int octeon3_eth_common_ndo_init(struct net_device	*netdev,
 	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
 	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
 	pki_prt_cfg.style_cfg.parm_cfg.wqe_skip = 1 * 128;
+#if defined(CONFIG_CAVIUM_IPFWD_OFFLOAD)
+	/* Comment: Need to reserve more bytes in the
+	 * first buffer in order to accommodate bigger L2 Header
+	 * when packet is being forwarded from one port to other port
+	 */
+	first_skip = 8 * 28 + extra_skip;
+#else
 	first_skip = 8 * 21 + extra_skip;
+#endif
 	later_skip = 8 * 16;
 	pki_prt_cfg.style_cfg.parm_cfg.first_skip = first_skip;
 	pki_prt_cfg.style_cfg.parm_cfg.later_skip = later_skip;
@@ -1895,6 +1996,267 @@ static inline void octeon3_prepare_skb_to_recycle(struct sk_buff *skb)
 	skb->truesize = sizeof(*skb) + skb_end_pointer(skb) - skb->head;
 }
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+/* Function to transmit data directly using work.
+ * This assumes that dis_wq_dat is clear for all PKI ports
+ * and hence the first segment of data is present in the work.
+ * This function assumes that it will only be called in the context
+ * of rx handler of octeon3-ethernet module
+ */
+int octeon3_transmit_qos(
+			struct net_device *dev,
+			void *work,
+			int do_free,
+			int qos_level)
+{
+	cvmx_wqe_78xx_t *wqe = work;
+	struct octeon3_ethernet *priv = netdev_priv(dev);
+	struct octeon3_ethernet_node *oen;
+	union cvmx_pko_send_hdr send_hdr;
+	union cvmx_pko_buf_ptr buf_ptr;
+	union cvmx_pko_send_work send_work;
+	cvmx_pko_send_free_t send_free;
+	union cvmx_pko_send_mem send_mem;
+	union cvmx_pko_lmtdma_data lmtdma_data;
+	union cvmx_pko_query_rtn query_rtn;
+	union cvmx_sso_grpx_aq_cnt aq_cnt;
+	unsigned int scr_off = CVMX_PKO_LMTLINE * CVMX_CACHE_LINE_SIZE;
+	unsigned int ret_off = scr_off;
+	struct sk_buff *skb = NULL;
+	u64 magic = 0;
+	int gaura = 0;
+	bool hw_free = false;
+	void **buf = NULL;
+	void *buffers_needed = NULL;
+	void **work_wkr = NULL;
+	u64 dma_addr;
+	u16 l4_hdr = IPPROTO_MAX;
+	int l4ptr = 0;
+	unsigned int checksum_alg;
+	int numa_node = priv->numa_node;
+	int tx_complete_grp;
+	struct octeon3_tx_cpustats *tx_stats;
+
+	skb = octeon3_eth_work_to_skb(work);
+
+	oen = octeon3_eth_node + numa_node;
+	tx_complete_grp = oen->tx_complete_grp;
+
+	/* Currently depending on octeon3-ethernet and doing minimal checks
+	 * as we get work directly from octeon3-ethernet
+	 * In future we can do multiple segment free when nat_align is not set
+	 * using multiple PKO_SEND_FREE command
+	 */
+	if (do_free && !(((cvmx_wqe_t *)work)->word0.pki.bufs > 1)) {
+		buf = (void **)PTR_ALIGN(skb->head, 128);
+		magic = (uint64_t)buf[SKB_AURA_OFFSET];
+		if (likely(buf[SKB_PTR_OFFSET] == skb) &&
+				likely((magic & 0xfffffffffffff000) ==
+					 SKB_AURA_MAGIC)) {
+			int		node;
+			int		aura;
+
+			gaura = magic & 0xfff;
+			node = gaura >> 10;
+			aura = gaura & 0x3ff;
+			buffers_needed = aura2bufs_needed[node][aura];
+			buf[SKB_AURA_OFFSET] = NULL;
+
+			hw_free = true;
+		}
+	}
+
+    /* SSO can only fall behind when the skb is not recycled */
+	if (!hw_free) {
+		aq_cnt.u64 = cvmx_read_csr_node(numa_node,
+				CVMX_SSO_GRPX_AQ_CNT(tx_complete_grp));
+
+		/* Drop the packet if pko or sso are not keeping up */
+		if (aq_cnt.s.aq_cnt > 100000)
+			goto skip_xmit;
+	}
+
+	/* Adjust the port statistics. */
+	tx_stats = get_cpu_ptr(priv->tx_stats);
+	if ((tx_stats->tx_backlog_cache + 1) >
+		(MAX_TX_QUEUE_DEPTH / CVMX_MAX_CORES)) {
+		s64 backlog = atomic64_add_return(tx_stats->tx_backlog_cache,
+						 &priv->tx_backlog);
+
+		if (unlikely(backlog > MAX_TX_QUEUE_DEPTH)) {
+			/* Decrement to be able to comeback for next pkt */
+			atomic64_sub(tx_stats->tx_backlog_cache,
+					&priv->tx_backlog);
+			put_cpu_ptr(priv->tx_stats);
+			goto skip_xmit;
+		}
+		tx_stats->tx_backlog_cache = 0;
+	}
+	tx_stats->tx_backlog_cache++;
+	tx_stats->tx_packets++;
+	tx_stats->tx_octets += skb->len;
+	put_cpu_ptr(priv->tx_stats);
+
+	/* Make sure packet data writes are committed before
+	 * submitting the command below
+	 */
+
+	/* Build the pko command */
+	send_hdr.u64 = 0;
+#ifdef __LITTLE_ENDIAN
+	send_hdr.s.le = 1;
+#endif
+	if (!OCTEON_IS_MODEL(OCTEON_CN78XX_PASS1_X))
+		send_hdr.s.n2 = 1; /* Don't allocate to L2 */
+
+	send_hdr.s.total = skb->len;
+	send_hdr.s.df = 1; /* Don't automatically free to FPA */
+	send_hdr.s.ii = 1; /* Don't automatically free to FPA */
+	/* Set gaura to desired value if we need to do a free */
+	send_hdr.s.aura = gaura;
+
+	if (cvmx_wqe_is_l3_ipv4(work)) {
+		send_hdr.s.l3ptr = ETH_HLEN + cvmx_wqe_get_unused8(work);
+		send_hdr.s.ckl3 = 1;
+		l4_hdr = ip_hdr(skb)->protocol;
+		/* Workaround for ipv4 checksum calculation */
+		send_hdr.s.l4ptr = send_hdr.s.l3ptr + (4 * ip_hdr(skb)->ihl);
+		l4ptr = send_hdr.s.l4ptr;
+
+	} else if (cvmx_wqe_is_l3_ipv6(work)) {
+		send_hdr.s.l3ptr = ETH_HLEN + cvmx_wqe_get_unused8(work);
+		l4_hdr = ipv6_hdr(skb)->nexthdr;
+		l4ptr = send_hdr.s.l3ptr + sizeof(struct ipv6hdr);
+	}
+
+	checksum_alg = 1; /* UDP == 1 */
+	switch (l4_hdr) {
+	case IPPROTO_SCTP:
+		if (OCTEON_IS_MODEL(OCTEON_CN78XX_PASS1_X))
+			break;
+		checksum_alg++; /* SCTP == 3 */
+		/* Fall through */
+	case IPPROTO_TCP: /* TCP == 2 */
+		checksum_alg++;
+		/* Fall through */
+	case IPPROTO_UDP:
+		send_hdr.s.l4ptr = l4ptr;
+		send_hdr.s.ckl4 = checksum_alg;
+		break;
+	default:
+		break;
+	}
+
+	preempt_disable();
+	cvmx_scratch_write64(scr_off, send_hdr.u64);
+	scr_off += sizeof(send_hdr);
+
+	buf_ptr.u64 = 0;
+
+	if (cvmx_wqe_get_bufs(wqe) > 1)
+		buf_ptr.s.subdc3 = CVMX_PKO_SENDSUBDC_LINK;
+	else
+		buf_ptr.s.subdc3 = CVMX_PKO_SENDSUBDC_GATHER;
+
+	/* Pointer to first segment of data */
+	buf_ptr.s.addr = wqe->packet_ptr.addr;
+	buf_ptr.s.size = wqe->packet_ptr.size;
+
+	cvmx_scratch_write64(scr_off, buf_ptr.u64);
+	scr_off += sizeof(buf_ptr);
+
+	/* Subtract 1 from the tx_backlog. */
+	send_mem.u64 = 0;
+	send_mem.s.subdc4 = CVMX_PKO_SENDSUBDC_MEM;
+	send_mem.s.dsz = MEMDSZ_B64;
+	send_mem.s.alg = MEMALG_SUB;
+	send_mem.s.offset = 1;
+	send_mem.s.addr = virt_to_phys(&priv->tx_backlog);
+	cvmx_scratch_write64(scr_off, send_mem.u64);
+	scr_off += sizeof(buf_ptr);
+
+	if (do_free && hw_free) {
+		/* Subtract 1 from buffers_needed */
+		send_mem.u64 = 0;
+		send_mem.s.subdc4 = CVMX_PKO_SENDSUBDC_MEM;
+		send_mem.s.dsz = MEMDSZ_B64;
+		send_mem.s.alg = MEMALG_SUB;
+		send_mem.s.offset = 1;
+		send_mem.s.addr = virt_to_phys(buffers_needed);
+		cvmx_scratch_write64(scr_off, send_mem.u64);
+		scr_off += sizeof(send_mem);
+
+		/* Free buffer when finished with the packet */
+		buf[SKB_PTR_OFFSET] = skb;
+		send_free.u64 = 0;
+		send_free.s.subdc4 = CVMX_PKO_SENDSUBDC_FREE;
+		send_free.s.addr = virt_to_phys(buf);
+		cvmx_scratch_write64(scr_off, send_free.u64);
+		scr_off += sizeof(send_free);
+
+		/* Reset only necessary fields in skb,
+		 * based on wqe handling in rx_one()
+		 * instead of calling octeon3_prepare_skb_to_recycle(skb);
+		 */
+		skb->cvm_info.rx_pkt_flags = 0;
+		skb->cvm_info.tx_pkt_flags = 0;
+		skb->cvm_info.cookie = 0;
+		skb->data_len = 0;
+		skb->truesize = sizeof(*skb) + skb_end_pointer(skb) - skb->head;
+
+	} else if (do_free) {
+		work_wkr = (void **)skb->cb;
+		work_wkr[0] = dev;
+		work_wkr[1] = NULL;
+		/* Send work when finished with the packet. */
+		send_work.u64 = 0;
+		send_work.s.subdc4 = CVMX_PKO_SENDSUBDC_WORK;
+		send_work.s.addr = virt_to_phys(work_wkr);
+		send_work.s.tt = CVMX_POW_TAG_TYPE_NULL;
+		send_work.s.grp = octeon3_eth_lgrp_to_ggrp(priv->numa_node,
+							priv->tx_complete_grp);
+		cvmx_scratch_write64(scr_off, send_work.u64);
+		scr_off += sizeof(send_work);
+	}
+
+	/* wmb */
+	wmb();
+
+	lmtdma_data.u64 = 0;
+	lmtdma_data.s.scraddr = ret_off >> 3;
+	lmtdma_data.s.rtnlen = wait_pko_response ? 1 : 0;
+	lmtdma_data.s.did = 0x51;
+	lmtdma_data.s.node = priv->numa_node;
+	lmtdma_data.s.dq = priv->pko_queue;
+	dma_addr = 0xffffffffffffa400ull | ((scr_off & 0x78) - 8);
+	cvmx_write64_uint64(dma_addr, lmtdma_data.u64);
+	preempt_enable();
+
+	if (wait_pko_response) {
+		CVMX_SYNCIOBDMA;
+
+		query_rtn.u64 = cvmx_scratch_read64(ret_off);
+		if (unlikely(query_rtn.s.dqstatus != PKO_DQSTATUS_PASS)) {
+			netdev_err(dev, "PKO enqueue failed for fast path%llx\n",
+				   (unsigned long long)query_rtn.u64);
+
+			if (do_free)
+				dev_kfree_skb_any(skb);
+		}
+	}
+
+	return 0;
+skip_xmit:
+	tx_stats = get_cpu_ptr(priv->tx_stats);
+	tx_stats->tx_dropped++;
+	put_cpu_ptr(priv->tx_stats);
+
+	dev_kfree_skb_any(skb);
+	return -1;
+}
+EXPORT_SYMBOL(octeon3_transmit_qos);
+#endif
+
 static int octeon3_eth_ndo_start_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct sk_buff *skb_tmp;
@@ -1922,6 +2284,9 @@ static int octeon3_eth_ndo_start_xmit(struct sk_buff *skb, struct net_device *ne
 	atomic64_t *buffers_needed = NULL;
 	void **buf;
 	unsigned int mss;
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	struct octeon3_tx_cpustats *tx_stats;
+#endif
 
 	frag_count = 0;
 	if (skb_has_frag_list(skb))
@@ -1992,9 +2357,19 @@ static int octeon3_eth_ndo_start_xmit(struct sk_buff *skb, struct net_device *ne
 	work[0] = netdev;
 	work[1] = NULL;
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	tx_stats = get_cpu_ptr(priv->tx_stats);
+	tx_stats->tx_packets++;
+	tx_stats->tx_octets += skb->len;
+	/* Since we are in dev_queue_xmit(), addup the backlog cache */
+	atomic64_add(tx_stats->tx_backlog_cache, &priv->tx_backlog);
+	tx_stats->tx_backlog_cache = 0;
+	put_cpu_ptr(priv->tx_stats);
+#else
 	/* Adjust the port statistics. */
 	atomic64_inc(&priv->tx_packets);
 	atomic64_add(skb->len, &priv->tx_octets);
+#endif
 
 	/* Make sure packet data writes are committed before
 	 * submitting the command below
@@ -2156,7 +2531,13 @@ static int octeon3_eth_ndo_start_xmit(struct sk_buff *skb, struct net_device *ne
 
 	return NETDEV_TX_OK;
 skip_xmit:
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	tx_stats = get_cpu_ptr(priv->tx_stats);
+	tx_stats->tx_dropped++;
+	put_cpu_ptr(priv->tx_stats);
+#else
 	atomic64_inc(&priv->tx_dropped);
+#endif
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -2178,6 +2559,9 @@ static struct rtnl_link_stats64 *octeon3_eth_ndo_get_stats64(struct net_device *
 	struct octeon3_ethernet *priv = netdev_priv(netdev);
 	u64 packets, octets, dropped;
 	u64 delta_packets, delta_octets, delta_dropped;
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	int cpu;
+#endif
 
 	spin_lock(&priv->stat_lock);
 
@@ -2206,9 +2590,20 @@ static struct rtnl_link_stats64 *octeon3_eth_ndo_get_stats64(struct net_device *
 	s->rx_length_errors = atomic64_read(&priv->rx_length_errors);
 	s->rx_crc_errors = atomic64_read(&priv->rx_crc_errors);
 
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	for_each_possible_cpu(cpu) {
+		struct octeon3_tx_cpustats *statsp;
+
+		statsp = per_cpu_ptr(priv->tx_stats, cpu);
+		s->tx_packets += statsp->tx_packets;
+		s->tx_bytes += statsp->tx_octets;
+		s->tx_dropped += statsp->tx_dropped;
+	}
+#else
 	s->tx_packets = atomic64_read(&priv->tx_packets);
 	s->tx_bytes = atomic64_read(&priv->tx_octets);
 	s->tx_dropped = atomic64_read(&priv->tx_dropped);
+#endif
 	return s;
 }
 
@@ -2477,6 +2872,10 @@ static int octeon3_eth_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+#ifdef CONFIG_CAVIUM_IPFWD_OFFLOAD
+	netdev->is_cvm_dev = 1;
+#endif
+
 	/* Using transmit queues degrades performance significantly */
 	netdev->priv_flags |= IFF_NO_QUEUE;
 
@@ -2491,6 +2890,14 @@ static int octeon3_eth_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&priv->list);
 	INIT_LIST_HEAD(&priv->srio_bcast);
 	priv->numa_node = pd->numa_node;
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	priv->tx_stats = alloc_percpu(struct octeon3_tx_cpustats);
+	if (!priv->tx_stats) {
+		dev_err(&pdev->dev, "Failed to allocated percpu tx stats\n");
+		free_netdev(netdev);
+		return -ENOMEM;
+	}
+#endif
 
 	mutex_lock(&octeon3_eth_node[priv->numa_node].device_list_lock);
 	list_add_tail_rcu(&priv->list, &octeon3_eth_node[priv->numa_node].device_list);
@@ -2526,6 +2933,9 @@ static int octeon3_eth_probe(struct platform_device *pdev)
 	if (register_netdev(netdev) < 0) {
 		dev_err(&pdev->dev, "Failed to register ethernet device\n");
 		list_del(&priv->list);
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+		free_percpu(priv->tx_stats);
+#endif
 		free_netdev(netdev);
 	}
 	netdev_info(netdev, "Registered\n");
@@ -2624,6 +3034,10 @@ static int octeon3_eth_remove(struct platform_device *pdev)
 
 	mutex_unlock(&oen->device_list_lock);
 	mutex_unlock(&octeon3_eth_init_mutex);
+
+#if defined(CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD)
+	free_percpu(priv->tx_stats);
+#endif
 	free_netdev(netdev);
 
 	return 0;

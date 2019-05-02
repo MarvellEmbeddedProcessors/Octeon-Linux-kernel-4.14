@@ -54,6 +54,10 @@
 #include <asm/octeon/cvmx-gmxx-defs.h>
 #include <asm/octeon/cvmx-smix-defs.h>
 
+#ifdef CONFIG_CAVIUM_OCTEON_IPFWD_OFFLOAD
+#include "ipfwd_config.h"
+#endif
+
 int rx_cpu_factor = 8;
 module_param(rx_cpu_factor, int, S_IRUGO | S_IWUSR | S_IWGRP);
 MODULE_PARM_DESC(rx_cpu_factor, "Control how many CPUs are used for packet reception.\n"
@@ -98,6 +102,24 @@ static int disable_lockless_pko;
 module_param(disable_lockless_pko, int, S_IRUGO);
 MODULE_PARM_DESC(disable_lockless_pko, "Disable lockless PKO access (use locking for queues instead).");
 
+#if defined(CONFIG_CAVIUM_IPFWD_OFFLOAD) && defined(IPFWD_OUTPUT_QOS)
+/* internal ports count for each port in a interface */
+int iport_count = 1;
+#include <asm/octeon/cvmx-helper.h>
+CVMX_SHARED void ipfwd_pko_queue_priority(int ipd_port, uint8_t *priorities)
+{
+	int i;
+
+	for (i = 0; i < 16; i++)
+		priorities[i] = CVMX_PKO_QUEUE_STATIC_PRIORITY;
+}
+
+/* pko queue count for each port in a interface */
+int queues_count = PKO_QUEUES_PER_PORT;
+#else
+/* pko queue count for each port in a interface */
+int queues_count = 1;
+#endif
 /* packet pool */
 int packet_pool = 0;
 /* wqe pool */
@@ -232,6 +254,43 @@ static bool cvm_oct_pko_lockless(void)
 	return queues <= cvm_oct_get_total_pko_queues();
 }
 
+#if defined(CONFIG_CAVIUM_IPFWD_OFFLOAD) && defined(IPFWD_OUTPUT_QOS)
+static void cvm_oct_set_pko_multiqueue(void)
+{
+	int interface, num_interfaces, rv;
+
+	num_interfaces = cvmx_helper_get_number_of_interfaces();
+	for (interface = 0; interface < num_interfaces; interface++) {
+		int num_ports, port;
+		cvmx_helper_interface_mode_t imode =
+			cvmx_helper_interface_get_mode(interface);
+
+		num_ports = cvmx_helper_interface_enumerate(interface);
+		for (port = 0; port < num_ports; port++) {
+			if (!cvmx_helper_is_port_valid(interface, port))
+				continue;
+			switch (imode) {
+			case CVMX_HELPER_INTERFACE_MODE_XAUI:
+			case CVMX_HELPER_INTERFACE_MODE_RXAUI:
+			case CVMX_HELPER_INTERFACE_MODE_SGMII:
+			case CVMX_HELPER_INTERFACE_MODE_QSGMII:
+			case CVMX_HELPER_INTERFACE_MODE_AGL:
+			case CVMX_HELPER_INTERFACE_MODE_RGMII:
+			case CVMX_HELPER_INTERFACE_MODE_GMII:
+			case CVMX_HELPER_INTERFACE_MODE_SPI:
+				rv = cvmx_pko_alloc_iport_and_queues(interface,
+						port, 1, queues_count);
+				WARN(rv, "cvmx_pko_alloc_iport_and_queues failed");
+				if (rv)
+					return;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+}
+#else
 static void cvm_oct_set_pko_multiqueue(void)
 {
 	int interface, num_interfaces, rv;
@@ -266,9 +325,13 @@ static void cvm_oct_set_pko_multiqueue(void)
 		}
 	}
 }
+#endif
 
 static int cvm_oct_configure_common_hw(void)
 {
+#if defined(CONFIG_CAVIUM_IPFWD_OFFLOAD) && defined(IPFWD_OUTPUT_QOS)
+	cvmx_override_pko_queue_priority = ipfwd_pko_queue_priority;
+#endif
 	/* Setup the FPA */
 	cvmx_fpa1_enable();
 
@@ -368,6 +431,23 @@ struct net_device *cvm_oct_register_callback(const char *device_name, cvm_oct_ca
 	return NULL;
 }
 EXPORT_SYMBOL(cvm_oct_register_callback);
+
+#ifdef CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD
+struct net_device *is_oct_dev(const char *device_name)
+{
+	struct octeon_ethernet *priv;
+
+	list_for_each_entry(priv, &cvm_oct_list, list) {
+		if (strcmp(device_name, priv->netdev->name) == 0) {
+			/* wmb */
+			wmb();
+			return priv->netdev;
+		}
+	}
+	return NULL;
+}
+EXPORT_SYMBOL(is_oct_dev);
+#endif
 
 /**
  * cvm_oct_free_work- Free a work queue entry
@@ -926,6 +1006,9 @@ static int cvm_oct_probe(struct platform_device *pdev)
 				continue;
 			}
 
+#ifdef CONFIG_CAVIUM_IPFWD_OFFLOAD
+			dev->is_cvm_dev = 1;
+#endif
 			/* Using transmit queues degrades performance significantly */
 			if (disable_core_queueing)
 				dev->priv_flags |= IFF_NO_QUEUE;
