@@ -485,4 +485,28 @@ config FUJITSU_ES
 
 source "drivers/net/hyperv/Kconfig"
 
+config CAVIUM_NET_PACKET_FWD_OFFLOAD
+	bool "Enable Cavium Octeon packet forwarding offload support"
+	default "n"
+	help
+	  This is required for Cavium Octeon ipfwd-offload/bridge offload modules.
+	  ipfwd offload and bridge offload modules use packet
+	  sending functionality exposed by this config.
+
+config CAVIUM_IPFWD_OFFLOAD
+	bool "Enable Cavium Octeon ip-offload module"
+	default "n"
+	depends on CAVIUM_NET_PACKET_FWD_OFFLOAD
+	help
+	  This enables packet callbacks for Cavium Octeon ipfwd-offload module.
+	  ipfwd-offload module can offload packet switching for
+	  tcp/udp/vlan/pppoe/gre packets over IPv4 and IPv6.
+
+config CAVIUM_BRIDGE_OFFLOAD
+	bool "Enable Cavium Octeon bridge module"
+	default "n"
+	depends on CAVIUM_NET_PACKET_FWD_OFFLOAD
+	help
+	  This enables Cavium Octeon bridge module.
+
 endif # NETDEVICES

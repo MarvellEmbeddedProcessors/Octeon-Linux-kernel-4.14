@@ -582,6 +582,129 @@ typedef unsigned int sk_buff_data_t;
 typedef unsigned char *sk_buff_data_t;
 #endif
 
+#ifdef CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD
+
+struct iphdr_new {
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u8    ihl:4,
+			version:4;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u8    version:4,
+			ihl:4;
+#else
+#error  "Please fix <asm/byteorder.h>"
+#endif
+	__u8    tos;
+	__be16  tot_len;
+	__be16  id;
+	__be16  frag_off;
+	__u8    ttl;
+	__u8    protocol;
+	__sum16 check;
+	__be32  saddr;
+	__be32  daddr;
+	/*The options start here. */
+};
+
+struct ipv6hdr_new {
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u8		priority:4,
+				version:4;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u8		version:4,
+				priority:4;
+#else
+#error	"Please fix <asm/byteorder.h>"
+#endif
+	__u8			flow_lbl[3];
+
+	__be16			payload_len;
+	__u8			nexthdr;
+	__u8			hop_limit;
+
+	uint64_t                saddrhi;
+	uint64_t                saddrlo;
+	uint64_t                daddrhi;
+	uint64_t                daddrlo;
+};
+
+struct cvm_udphdr {
+	__be16	source;
+	__be16	dest;
+	__be16	len;
+	__sum16	check;
+};
+
+struct cvm_pppoe_hdr {
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u8 ver : 4;
+	__u8 type : 4;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u8 type : 4;
+	__u8 ver : 4;
+#else
+#error  "Please fix <asm/byteorder.h>"
+#endif
+	__u8 code;
+	__be16 sid;
+	__be16 length;
+};
+
+struct cvm_vlan_hdr {
+	__be16 h_vlan_TCI;
+	__be16 h_vlan_encapsulated_proto;
+};
+
+struct cvm_vxlan_hdr {
+	__be32 vx_flags;
+	__be32 vx_vni;
+};
+
+struct gre_hdr_info {
+	__be16 flags;
+	__be16 protocol;
+	__be32 key;
+	__be32 headroom;
+};
+
+
+struct cvm_packet_info {
+	unsigned long		rx_pkt_flags;
+	unsigned long		tx_pkt_flags;
+	u32			cookie;		/* magic number */
+	void			*bucket;	/* bucket ptr */
+	void			*frag_bucket;	/* Frag bucket ptr */
+	u32			seq;	/* TCP seq number (if present) */
+	u32			ack_seq; /* TCP ack number (if present) */
+	int			qos_level;
+	struct cvm_vlan_hdr	vlan;
+	struct cvm_vxlan_hdr	vxlan;
+	struct cvm_pppoe_hdr	pppoe;
+	struct gre_hdr_info	gre;
+	union {
+		struct iphdr_new	outer_ip4;	/* IP header */
+		struct ipv6hdr_new	outer_ip6;
+	};
+	struct cvm_udphdr	outer_udp;
+	union {
+		struct {
+			u32			old_reserved1;
+			struct iphdr_new	cvm_ip;	/* IP header */
+			u64			reserved2[2];
+		} cvm_ip4;
+		struct ipv6hdr_new  cvm_ip6;
+	} cvm_ip4_ip6_u;
+	u64	reserved2[2];	/* L4 ports and reserved */
+#define cvmip                            cvm_ip4_ip6_u.cvm_ip4.cvm_ip
+#define cvmip6                           cvm_ip4_ip6_u.cvm_ip6
+};
+#endif
+
+
+
+
+
+
 /** 
  *	struct sk_buff - socket buffer
  *	@next: Next buffer in list
@@ -827,6 +950,9 @@ struct sk_buff {
 	__u16			transport_header;
 	__u16			network_header;
 	__u16			mac_header;
+#ifdef CONFIG_CAVIUM_NET_PACKET_FWD_OFFLOAD
+	struct cvm_packet_info	cvm_info;
+#endif
 
 	/* private: */
 	__u32			headers_end[0];
