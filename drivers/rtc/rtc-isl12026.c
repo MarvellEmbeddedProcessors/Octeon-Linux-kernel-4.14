@@ -5,6 +5,7 @@
  * Copyright (c) 2018 Cavium, Inc.
  */
 #include <linux/types.h>
+#include <linux/err.h>
 #include <linux/nvmem-provider.h>
 #include <linux/of_device.h>
 #include <linux/module.h>
