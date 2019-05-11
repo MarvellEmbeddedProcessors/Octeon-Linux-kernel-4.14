@@ -680,6 +680,9 @@ static void octeon3_eth_replenish_rx(struct octeon3_ethernet *priv, int count)
 			break;
 		}
 		buf = (void **)PTR_ALIGN(skb->head, 128);
+#ifdef CAVIUM_NET_PACKET_FWD_OFFLOAD
+		skb->data = skb->head + NET_SKB_PAD;
+#endif
 		buf[SKB_PTR_OFFSET] = skb;
 		cvmx_fpa3_free(buf,
 			__cvmx_fpa3_gaura(priv->numa_node, priv->pki_laura),
@@ -2194,15 +2197,7 @@ int octeon3_transmit_qos(
 		cvmx_scratch_write64(scr_off, send_free.u64);
 		scr_off += sizeof(send_free);
 
-		/* Reset only necessary fields in skb,
-		 * based on wqe handling in rx_one()
-		 * instead of calling octeon3_prepare_skb_to_recycle(skb);
-		 */
-		skb->cvm_info.rx_pkt_flags = 0;
-		skb->cvm_info.tx_pkt_flags = 0;
-		skb->cvm_info.cookie = 0;
-		skb->data_len = 0;
-		skb->truesize = sizeof(*skb) + skb_end_pointer(skb) - skb->head;
+		octeon3_prepare_skb_to_recycle(skb);
 
 	} else if (do_free) {
 		work_wkr = (void **)skb->cb;
